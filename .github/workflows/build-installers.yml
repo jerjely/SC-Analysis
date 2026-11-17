@@ -1,0 +1,194 @@
+# Builds the SC Analysis installers on GitHub's machines.
+#
+#  * Push a tag  v1.2.0               -> build, self-test, release "v1.2.0" with the 3 installers
+#  * Actions -> Run workflow, version "1.2.0" -> same, and the release creates the tag v1.2.0
+#  * Actions -> Run workflow, version empty   -> build + self-test only (installers kept as
+#                                               workflow artifacts for 7 days, no release)
+name: Build installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to release, e.g. 1.2.0 (creates tag v1.2.0). Leave empty to only build and test.'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-installers-${{ github.ref }}-${{ inputs.version }}
+  cancel-in-progress: false
+
+env:
+  APP: SC-Analysis
+  PYTHON_VERSION: '3.12'
+  INPUT_VERSION: ${{ inputs.version }}
+
+jobs:
+  windows:
+    name: Windows installer
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Version
+        id: v
+        run: python install/ci_version.py
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.10"
+      - name: Build the app (PyInstaller)
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build install/sc_analysis.spec
+      - name: Self-test of the built app
+        timeout-minutes: 25
+        run: |
+          $report = Join-Path $PWD "selftest.txt"
+          $p = Start-Process -FilePath "dist\SC-Analysis\SC-Analysis.exe" -ArgumentList "--selftest", "`"$report`"" -Wait -PassThru
+          if (Test-Path $report) { Get-Content $report } else { Write-Host "no report written" }
+          if ($p.ExitCode -ne 0) { throw "Self-test failed (exit code $($p.ExitCode))" }
+      - name: Build the installer (Inno Setup)
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc "/DMyAppVersion=${{ steps.v.outputs.version }}" install\windows_installer.iss
+          if ($LASTEXITCODE -ne 0) { throw "Inno Setup failed" }
+          Get-ChildItem dist\*.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/${{ env.APP }}-*-Windows-setup.exe
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-windows
+          path: selftest.txt
+          if-no-files-found: ignore
+
+  mac:
+    name: Mac installer (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: AppleSilicon
+            runner: macos-15          # Apple silicon (arm64)
+            hostarch: arm64
+          - label: Intel
+            runner: macos-15-intel    # Intel (x86_64); also runs on Apple silicon via Rosetta
+            hostarch: x86_64,arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - name: Version
+        id: v
+        run: python install/ci_version.py
+      - name: Install packages
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt "pyinstaller>=6.10"
+      - name: Build the app (PyInstaller)
+        run: python -m PyInstaller --noconfirm --distpath dist --workpath build install/sc_analysis.spec
+      - name: Self-test of the built app
+        timeout-minutes: 25
+        run: |
+          uname -m
+          set +e
+          "dist/SC Analysis.app/Contents/MacOS/SC-Analysis" --selftest "$PWD/selftest.txt"
+          rc=$?
+          set -e
+          [ -f selftest.txt ] || echo "no report written"
+          exit $rc
+      - name: Build the installer package
+        run: bash install/make_pkg.sh "${{ steps.v.outputs.version }}" "${{ matrix.label }}" "${{ matrix.hostarch }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mac-${{ matrix.label }}
+          path: dist/${{ env.APP }}-*-macOS-${{ matrix.label }}.pkg
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selftest-mac-${{ matrix.label }}
+          path: selftest.txt
+          if-no-files-found: ignore
+
+  release:
+    name: Publish the release
+    needs: [windows, mac]
+    if: needs.windows.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      VERSION: ${{ needs.windows.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - name: Check the three installers
+        run: |
+          rm -f out/selftest.txt
+          ls -la out
+          for f in "$APP-$VERSION-Windows-setup.exe" "$APP-$VERSION-macOS-AppleSilicon.pkg" "$APP-$VERSION-macOS-Intel.pkg"; do
+            [ -f "out/$f" ] || { echo "missing $f"; exit 1; }
+          done
+      - name: Release notes
+        run: |
+          cat > notes.md <<NOTES
+          ## SC Analysis $VERSION
+
+          GUI for the SC Neuropixels analysis pipeline: recording viewer, stimulus sync, RF mapping,
+          Baden-style clustering, pickers, sweep / loom / CCF / pupil analyses and pooled
+          multi-recording classification. Every installer passed the built-in self-test before upload.
+
+          | Computer | Download |
+          |---|---|
+          | Windows 10/11 (64-bit) | \`$APP-$VERSION-Windows-setup.exe\` |
+          | Mac with Apple silicon (M1–M4) | \`$APP-$VERSION-macOS-AppleSilicon.pkg\` |
+          | Mac with Intel processor | \`$APP-$VERSION-macOS-Intel.pkg\` |
+
+          ### Opening the unsigned installers
+          - **Windows:** if "Windows protected your PC" appears, click **More info → Run anyway**.
+            Installs for your user only (no admin rights); Start menu entry, optional desktop shortcut.
+          - **Mac:** if the package is blocked, open **System Settings → Privacy & Security**, scroll down
+            and click **Open Anyway** (or right-click the .pkg → Open). The app goes to /Applications.
+
+          Kilosort4 / Phy, SpikeGLX / CatGT, PsychoPy and DeepLabCut are not included; the app reads
+          their output files. See the README for details.
+          NOTES
+          sed -i 's/^          //' notes.md
+          cat notes.md
+      - name: Create or update the release
+        run: |
+          TAG="v$VERSION"
+          FILES=("out/$APP-$VERSION-Windows-setup.exe" "out/$APP-$VERSION-macOS-AppleSilicon.pkg" "out/$APP-$VERSION-macOS-Intel.pkg")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${FILES[@]}" --clobber
+            gh release edit "$TAG" --notes-file notes.md
+          else
+            gh release create "$TAG" "${FILES[@]}" --title "SC Analysis $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+          fi

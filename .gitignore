@@ -1,0 +1,47 @@
+# --- build output ---
+build/
+dist/
+*.spec.bak
+install/win_version.txt
+*.egg-info/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# --- data, recordings, results (never commit) ---
+*.bin
+*.dat
+*.meta
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.mat
+*.avi
+*.mp4
+*.mov
+*.psydat
+*.log
+*.csv
+*.tsv
+*.json
+!.github/**/*.json
+*.eps
+*.pdf
+*_pooled/
+clustering_export/
+ccf_s1_*/
+sweep_cell_plots/
+ks4_output*/
+sorter_output/
+selftest*.txt
+report.txt
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
